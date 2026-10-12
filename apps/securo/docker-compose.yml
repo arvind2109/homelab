@@ -1,1 +1,104 @@
-# Securo Docker Compose configuration goes here.
+name: securo
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/securo
+  SECRET_KEY: ${SECRET_KEY}
+  DEBUG: "false"
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+  SIMPLEFIN_ENABLED: ${SIMPLEFIN_ENABLED:-false}
+  SIMPLEFIN_API_URL: ${SIMPLEFIN_API_URL:-https://beta-bridge.simplefin.org}
+  ENABLE_BANKING_APP_ID: ${ENABLE_BANKING_APP_ID:-}
+  ENABLE_BANKING_PRIVATE_KEY_FILE: ${ENABLE_BANKING_PRIVATE_KEY_FILE:-/app/secrets/enable_banking_private.pem}
+  ENABLE_BANKING_OAUTH_REDIRECT_URI: ${ENABLE_BANKING_OAUTH_REDIRECT_URI:-}
+  PLUGGY_CLIENT_ID: ${PLUGGY_CLIENT_ID:-}
+  PLUGGY_CLIENT_SECRET: ${PLUGGY_CLIENT_SECRET:-}
+  OPENEXCHANGERATES_APP_ID: ${OPENEXCHANGERATES_APP_ID:-}
+  TESOURO_DIRETO_ENABLED: ${TESOURO_DIRETO_ENABLED:-false}
+  REDIS_URL: redis://redis:6379/0
+  STORAGE_LOCAL_PATH: /app/data/attachments
+  AGENTS_KNOWLEDGE_STORAGE_PATH: /app/data/agent_knowledge
+  AGENTS_ENABLED: ${AGENTS_ENABLED:-false}
+  AGENTS_BUILTIN_MCP_URL: http://mcp-server:8765/mcp
+  AGENTS_MCP_JWT_SECRET: ${AGENTS_MCP_JWT_SECRET:-change-me-too}
+  AGENTS_DEFAULT_PROVIDER: ${AGENTS_DEFAULT_PROVIDER:-ollama}
+  AGENTS_OLLAMA_BASE_URL: ${AGENTS_OLLAMA_BASE_URL:-http://ollama:11434}
+  AGENTS_EMBEDDING_PROVIDER: ${AGENTS_EMBEDDING_PROVIDER:-native}
+
+x-backend-base: &backend-base
+  image: ghcr.io/securo-finance/securo-backend:latest
+  environment: *backend-env
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    db: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  volumes:
+    - /var/libsecuro/secrets:/app/secrets:ro
+    - /var/lib/securo/attachments:/app/data/attachments
+    - /var/lib/securo/agent_knowledge:/app/data/agent_knowledge
+    - /var/lib/securo/embedding_models:/app/data/embedding_models
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:8-alpine
+    container_name: securo-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: securo-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: securo
+    volumes:
+      - /var/lib/securo/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    <<: *backend-base
+    container_name: securo-backend
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+  frontend:
+    image: ghcr.io/securo-finance/securo-frontend:latest
+    container_name: securo-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:8080"
+    environment:
+      BACKEND_URL: http://backend:8000
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  celery-worker:
+    <<: *backend-base
+    container_name: securo-worker
+    command: celery -A app.worker worker --loglevel=info --concurrency=2
+
+  celery-beat:
+    <<: *backend-base
+    container_name: securo-beat
+    command: celery -A app.worker beat --loglevel=info
+
+  mcp-server:
+    <<: *backend-base
+    container_name: securo-mcp
+    profiles: [agents]
+    command: uvicorn mcp_server.main:app --host 0.0.0.0 --port 8765
+    ports:
+      - "${AGENTS_MCP_EXTERNAL_HOST_PORT:-0.0.0.0:8765}:8765"
